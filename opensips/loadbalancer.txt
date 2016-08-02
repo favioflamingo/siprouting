@@ -1,0 +1,381 @@
+#
+# $Id$
+#
+# this example shows use of ser as stateless redirect server
+#
+
+# ------------------ module loading ----------------------------------
+
+debug=3
+#fork=no
+log_stderror=no
+
+advertised_address="106.187.34.86"
+advertised_port=5060
+#alias="114.185.220.32:5060"
+
+#set module path
+mpath="/usr/local/lib/opensips/modules/"
+
+
+loadmodule "usrloc.so"
+loadmodule "db_postgres.so"
+loadmodule "signaling.so"
+loadmodule "domain.so"
+loadmodule "sl.so"
+loadmodule "tm.so"
+loadmodule "rr.so"
+loadmodule "dialog.so"
+loadmodule "maxfwd.so"
+loadmodule "textops.so"
+loadmodule "mi_fifo.so"
+loadmodule "dispatcher.so"
+loadmodule "nathelper.so"
+loadmodule "permissions.so"
+loadmodule "registrar.so"
+#loadmodule "xlog.so"
+loadmodule "load_balancer.so"
+loadmodule "uri.so"
+
+
+
+# ----------------- setting module-specific parameters ---------------
+modparam("uri", "db_url", "postgres://linode01opensips:ninjacowboy2011@localhost:49532/foswikidb")
+#modparam("textops", "db_url", "postgres://linode01opensips:ninjacowboy2011@localhost:49532/foswikidb")
+modparam("usrloc", "db_url", "postgres://linode01opensips:ninjacowboy2011@localhost:49532/foswikidb")
+modparam("permissions", "db_url", "postgres://linode01opensips:ninjacowboy2011@localhost:49532/foswikidb")
+modparam("domain", "db_url", "postgres://linode01opensips:ninjacowboy2011@localhost:49532/foswikidb")
+modparam("dialog", "db_url", "postgres://linode01opensips:ninjacowboy2011@localhost:49532/foswikidb")
+modparam("dispatcher", "db_url", "postgres://linode01opensips:ninjacowboy2011@localhost:49532/foswikidb")
+modparam("load_balancer", "db_url", "postgres://linode01opensips:ninjacowboy2011@localhost:49532/foswikidb")
+
+# !! Nathelper
+modparam("usrloc","nat_bflag",6)
+modparam("registrar", "received_avp", "$avp(42)")
+modparam("nathelper","sipping_bflag",7)
+modparam("nathelper", "ping_nated_only", 0)   # Ping only clients behind NAT
+modparam("nathelper", "received_avp", "$avp(42)")
+modparam("nathelper", "sipping_from", "sip:pinger@106.187.34.86")
+modparam("nathelper", "natping_interval", 10)
+
+
+modparam("mi_fifo", "fifo_name", "/tmp/opensips_fifo")
+
+#modparam("dialog", "dlg_flag", 13)
+modparam("dialog", "db_mode", 0)
+modparam("dialog", "table_name", "freeswitch.dialog")
+
+
+modparam("rr", "enable_double_rr", 1)
+modparam("rr", "append_fromtag", 1)
+
+modparam("tm", "fr_timer", 2)
+
+modparam("uri", "db_table", "freeswitch.subscriber")
+
+
+modparam("dispatcher", "ds_ping_method", "OPTIONS")
+modparam("dispatcher", "ds_ping_interval", 5)
+modparam("dispatcher", "ds_probing_threshhold", 2)
+modparam("dispatcher", "ds_probing_mode", 1)
+modparam("dispatcher", "table_name", "freeswitch.dispatcher")
+#modparam("dispatcher", "list_file", "/etc/opensips/dispatcher.list")
+
+
+
+modparam("load_balancer", "probing_method", "OPTIONS")
+modparam("load_balancer", "probing_interval", 5)
+modparam("load_balancer", "db_table", "freeswitch.load_balancer")
+
+# -- usrloc params --
+modparam("usrloc", "db_mode",   2)
+modparam("usrloc", "matching_mode", 0)
+modparam("usrloc", "use_domain", 1)
+modparam("usrloc", "desc_time_order", 1) #make sure newest record is used
+
+# -- domain params --
+modparam("domain", "db_mode", 0)   # Use caching
+modparam("domain", "domain_table", "freeswitch.opensips_domains")
+modparam("domain", "domain_col", "domain_name")
+
+modparam("permissions", "address_table", "freeswitch.address")
+
+
+####### Routing Logic ########
+
+
+# main request routing logic
+
+route{
+
+        if (!mf_process_maxfwd_header("10")) {
+                sl_send_reply("483","Too Many Hops");
+                exit;
+        }
+	#--- Nat Detection ---#	
+	force_rport();
+	if( nat_uac_test("19")){
+		if(is_method("Register")) {
+			fix_nated_register();
+		}
+		else {
+			fix_nated_contact();
+		}
+		setflag(5);
+	}
+	# logging
+	#xlog("ACK outside 1 [$rm/$fu/$tu/$ru/$ci/$Ri]\n");
+	
+	#--- Sequential requests section ---#
+	if(has_totag()){
+		#xlog("ACK inside 1 [Method is $rm and DU is $du]\n");
+		if(loose_route()) {
+			if( is_method("ACK") ){
+				#xlog("ACK inside ACK Checker [DU is $du/OU is $ou/RU is $ru/$ci]\n");
+				$du = $ou;
+				$ru = $ou;
+				t_relay();
+				exit;
+			}
+			else if(is_method("BYE")){
+			#xlog("BYE inside 1 [$rm/$du/$fu/$tu/$ru/$ci]\n");
+				setflag(1);
+				setflag(3);
+				$du = $ou;
+				$ru = $ou;
+			xlog("BYE inside 1 [$rm/$du/$fu/$tu/$ru/$ci]\n");
+			}
+			else  if (is_method("INVITE")){
+				record_route();
+			}
+			#xlog("ACK inside 2 [$rm/$du/$fu/$tu/$ru/$ci]\n");
+			route(1);
+		}
+		else {
+			if( is_method("ACK") ){
+				#xlog("ACK inside 3 [$rm/$du/$fu/$tu/$ru/$ci]\n");
+				if( t_check_trans() ){
+					t_relay();
+					exit;
+				}
+				else {
+					exit;
+				}
+			}
+			sl_send_reply("404","Not here");
+		}
+		exit;
+	}
+
+	#--- initial requests section ---#
+	if(is_method("CANCEL") ){
+		if(t_check_trans()) {
+			t_relay();
+			exit;
+		}
+	} #???
+	t_check_trans(); # not in dialog, but associated with transaction
+	if(!is_method("REGISTER") && ( is_from_local() || ds_is_in_list("$si", "$sp")) ) {
+		#xlog("ACK after trans 1 [$fu/$tu/$ru/$ci]\n");
+		#if(!allow_routing()){
+			#if (!proxy_authorize("", "freeswitch.subscriber")) {
+			#	proxy_challenge("", "0");  # Realm will be autogenerated
+			#}
+		#}
+		#else {
+
+		#}
+		#consume_credentials();
+	}
+	#--- preloaded route checking ---#
+	if(loose_route()) {
+		#xlog("L_ERR","Attempt to route with preloaded Route's[$fu/$tu/$ru/$ci]");
+		if(!is_method("ACK")) {
+			sl_send_reply("403","Preload Route denied");
+			exit;
+		}
+
+	}
+	#--- record routing ---#
+	if(!is_method("REGISTER|MESSAGE")){
+		record_route();
+		# account only INVITES
+		if(is_method("INVITE")){
+			setflag(1); # do accounting
+		}
+		#---- Routing to external domains ----#
+		if(!is_uri_host_local()){
+			append_hf("P-hint: outbound\r\n");
+			# must be going to freeswitch
+			
+		}
+	}
+	if(is_method("REGISTER")){
+		# authenticate register requests
+		
+		# request is behind NAT(flag 5) save with bflag 6 -#
+
+		# use bflag 7 to start SIP pinging (Options)
+		if(isflagset(5)){
+			setbflag(6);
+			setbflag(7);
+		}
+		# save on the reply from freeswitch
+		#save("freeswitch.location","vsr");
+		t_on_reply("11");
+		# send to media servers (aka freeswitch)
+		route(5);
+	}
+	
+	
+	# send it to media servers
+	if(!ds_is_in_list("$si", "$sp")){
+		route(5);	
+	}
+	# send it to the user
+	else {
+		# do a lookup
+		lookup("freeswitch.location","b");
+		switch ($retcode) {
+			case -1:
+			case -3:
+			sl_send_reply("404", "Not Found");
+			exit;
+			case -2:
+			sl_send_reply("405", "Not Found");
+			exit;
+		};
+		route(1);
+	}	
+	send_reply("420","Invalid Extension");
+	exit;
+}
+
+route[1] {
+	# for INVITE enable some additional helper routes
+	#-- if nat=yes in the R-URI set flag 6
+	#-- used to process Re-invites
+	if(subst_uri('/(sip:.*);nat=yes/\1/')){
+		setbflag(6);
+	}
+	#-- if caller(flag 5) or callee(flag 6) are behind NAT --#
+	if(isflagset(5)||isflagset(6)){
+		route(6);
+	}
+	if(isflagset(5)){
+		search_append('Contact:.*sip:[^>[:cntrl:]]*',';nat=yes');
+	}
+	if(is_method("INVITE")){
+		#t_on_branch("2");
+		t_on_reply("2");
+		t_on_failure("1");
+	}
+	#xlog("ACK route 1 outside [$du/$fu/$tu/$ru/$ci]\n");
+	if(!t_relay()){
+		#xlog("ACK route 1 inside [$du/$fu/$tu/$ru/$ci]\n");
+		sl_reply_error();
+	}
+	exit;
+}
+
+# Route for user lookups
+#route[3]
+	# not needed....
+
+# PSTN routing
+#route[4] 
+	# not needed...
+
+#--- Route to media servers ---#
+route[5] {
+	xlog("route to media servers");
+	# if a register, dispatch
+	if(is_method("REGISTER")){
+		xlog("L_INFO", "[$mi] [$rs $rr]\n Registering Route: $ru\n");
+		if (!ds_select_dst("1", "6")) {
+			xlog("L_INFO", "[$mi] [$rs $rr]\n Rejecting Registration Route: $ru\n");
+                	send_reply("503","Service Unavailable");
+                	exit;
+                }
+	}
+	else {
+		if (!load_balance("1","transc;pstn")) {
+			send_reply("503","Service Unavailable");
+			exit;
+		}
+	}
+	# rewritehostport("106.187.36.121:5060");
+	route(1);
+}
+#--- RTP Proxy handling ---#
+route[6] {
+	if(is_method("BYE|CANCEL")){
+		# unforce_rtp_proxy();
+	}
+	else if (is_method("INVITE")) {
+		if(isflagset(5)) {
+			# caller is natted
+			#fix_nated_sdp("2","106.187.36.121");
+		}
+		t_on_failure("1");
+	}
+}
+#branch_route[2] {
+#	#xlog("new branch at $ru\n");
+#}
+onreply_route[2] {
+	#--- Handling of the SDP for the 200 or 183 reply ---#
+	#--- if behind nat (flags 5 or 6) start RTP proxy ---#
+	#--- activates the rtp proxy for teh CALLER ---#
+	if ((isflagset(5)||isbflagset(6)) && status=~"(183)|(2[0-9][0-9])"){
+		if(isflagset(6)) {
+			# callee is natted alpha client
+			#fix_nated_sdp("2","106.187.36.121");
+		}
+		append_hf("P-hint: onreply_route|force_rtp_proxy\r\n");
+	}
+	#--- if the callee is behind NAT, fix the contact HF ---#
+	if(isbflagset(6)) {
+		#-- insert nat=yes at the end of the contact header --#
+		#-- this helps reinvites --#
+		#-- nat=yes will be included in the r-uri for seq. requests-"
+		search_append('Contact:.*sip:[^>[:cntrl:]]*',';nat=yes');
+		append_hf("P-hint: Onreply-route - fixcontact \r\n");
+		fix_nated_contact();
+	}
+	exit;
+}
+failure_route[1]{
+	#--- if a failure has occurred, deactivate the rtp proxy ---#
+	if(isflagset(5) || isbflagset(6)) {
+		#unforce_rtp_proxy();
+	}
+	if(t_was_cancelled()){
+		exit;
+	}	
+}
+
+# for dealing with register replies
+onreply_route[11] {
+	# Here we handle REGISTER replies
+	xlog("L_INFO", "[$mi] [$rs $rr]\n Route: $ru\n");
+
+	if (status=~"200") {
+		# registration was successful
+		route(11);
+	};
+#	if(status=~"401"){
+#		# registration failed
+#		# write this into the logs for fail2ban
+#		xlog("L_NOTICE","Auth error for $fU@$fd from $si");
+#	};
+}
+
+route[11] {
+	# workaround for location saving
+	xlog("L_INFO", "saving location\n");
+	#save("freeswitch.location","0x02");
+	save("freeswitch.location","vsr");
+}
+
+
